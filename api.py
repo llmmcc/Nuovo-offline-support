@@ -13,6 +13,7 @@ from datetime import datetime
 import struct
 import time
 from collections import defaultdict
+from offline_uuid import generate_offline_uuid
 
 
 router = APIRouter()
@@ -61,15 +62,21 @@ async def get_auth_id(username: str, db: Session = Depends(get_db)):
     db.commit()
     return Response(content=auth_id, media_type="text/plain")
 
-
+# 在验证函数中添加离线模式支持
+# 在 api.py 中完全重写 verify 函数
 @router.get("/api/auth/verify")
 async def verify(id: str, db: Session = Depends(get_db)):
+    """简化验证 - 完全跳过Mojang验证"""
     token_str = secrets.token_urlsafe(16)
     pv = db.query(PendingVerification).filter_by(id=id).first()
+    
     if not pv:
         return Response(content="Invalid ID", status_code=400)
+    
+    # 检查用户是否已存在
     user = db.query(User).filter_by(username=pv.username).first()
     if user:
+        # 更新token
         old_token = db.query(Token).filter_by(user_uuid=user.uuid).first()
         if old_token:
             db.delete(old_token)
@@ -78,20 +85,140 @@ async def verify(id: str, db: Session = Depends(get_db)):
         db.delete(pv)
         db.commit()
         return Response(content=token_str, media_type="text/plain")
-    auth_url = f"https://sessionserver.mojang.com/session/minecraft/hasJoined?username={pv.username}&serverId={id}"
-    async with httpx.AsyncClient() as client:
-        response = await client.get(auth_url)
-        if response.status_code != 200:
-            return Response(content="Verification failed with Mojang", status_code=403)
-    user_uuid = str(uuidlib.UUID(response.json().get("id")))
+    
+    # 生成离线UUID（完全跳过Mojang）
+    user_uuid = generate_offline_uuid(pv.username)
+    
+    # 创建用户
     user = User(uuid=user_uuid, username=pv.username)
     db.add(user)
     db.flush()
     db.add(Token(token=token_str, user_uuid=user.uuid))
     db.delete(pv)
     db.commit()
+    
     return Response(content=token_str, media_type="text/plain")
-
+# 在 api.py 中添加
+@router.websocket("/ws/direct")
+async def websocket_direct(websocket: WebSocket, db: Session = Depends(get_db)):
+    """
+    直接WebSocket连接，无需复杂验证
+    用于离线模式客户端
+    """
+    await websocket.accept()
+    
+    user = None
+    user_uuid = None
+    
+    try:
+        # 接收第一条消息（应该是用户名）
+        data = await websocket.receive_text()
+        
+        if not data:
+            await websocket.close(code=1008, reason="No username provided")
+            return
+        
+        # 假设data是用户名
+        username = data.strip()
+        
+        # 生成离线UUID
+        user_uuid = generate_offline_uuid(username)
+        
+        # 查找或创建用户
+        user = db.query(User).filter_by(uuid=user_uuid).first()
+        if not user:
+            user = User(uuid=user_uuid, username=username)
+            db.add(user)
+            db.commit()
+        
+        # 连接成功
+        active_connections[user.uuid] = websocket
+        
+        # 发送认证成功消息
+        await websocket.send_bytes(b'\x00')  # S2C.AUTH
+        
+        print(f"Direct WebSocket connected: {username} ({user_uuid})")
+        
+        # 主循环
+        while True:
+            try:
+                msg = await websocket.receive_bytes()
+                # 这里可以添加消息处理逻辑
+                # 暂时简单回显
+                await websocket.send_bytes(b'\x01' + msg)
+                
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                print(f"WebSocket error: {e}")
+                break
+                
+    except Exception as e:
+        print(f"Direct WebSocket connection error: {e}")
+    finally:
+        if user_uuid and user_uuid in active_connections:
+            del active_connections[user_uuid]
+        try:
+            await websocket.close()
+        except:
+            pass
+# 修改 get_user_by_token 函数，使其更灵活
+def get_user_by_token(token: str, db: Session):
+    """通过token获取用户"""
+    if not token:
+        return None
+    
+    token_obj = db.query(Token).filter_by(token=token).first()
+    if not token_obj:
+        # 如果找不到token，尝试将token作为用户名处理（离线模式）
+        # 这允许客户端使用用户名作为token直接连接
+        if CONFIG.get("allowUsernameAsToken", False):
+            # 假设token实际上是一个用户名
+            username = token
+            user_uuid = generate_offline_uuid(username)
+            user = db.query(User).filter_by(uuid=user_uuid).first()
+            if not user:
+                # 创建新用户
+                user = User(uuid=user_uuid, username=username)
+                db.add(user)
+                db.flush()
+                # 创建token记录
+                new_token_obj = Token(token=token, user_uuid=user.uuid)
+                db.add(new_token_obj)
+                db.commit()
+            return user
+        return None
+    
+    return db.query(User).filter_by(uuid=token_obj.user_uuid).first()
+@router.get("/api/auth/offline")
+async def offline_auth(username: str, db: Session = Depends(get_db)):
+    """完全离线的验证端点"""
+    token_str = secrets.token_urlsafe(16)
+    
+    # 生成离线UUID
+    user_uuid = generate_offline_uuid(username)
+    
+    # 查找或创建用户
+    user = db.query(User).filter_by(uuid=user_uuid).first()
+    if not user:
+        user = User(uuid=user_uuid, username=username)
+        db.add(user)
+        db.flush()
+    
+    # 创建或更新token
+    old_token = db.query(Token).filter_by(user_uuid=user.uuid).first()
+    if old_token:
+        db.delete(old_token)
+    
+    new_token = Token(token=token_str, user_uuid=user.uuid)
+    db.add(new_token)
+    db.commit()
+    
+    return {
+        "token": token_str,
+        "uuid": user_uuid,
+        "username": username
+    }
 
 def get_user_by_token(token: str, db: Session):
     token_obj = db.query(Token).filter_by(token=token).first()
